@@ -318,7 +318,7 @@ EOF
     echo ""
 
     set +e
-    claude --model "$CURRENT_MODEL" --print --dangerously-skip-permissions "$PROMPT"
+    claude --model "$CURRENT_MODEL" --print --dangerously-skip-permissions "$PROMPT" < /dev/null
     CLAUDE_EXIT=$?
     set -e
 
