@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+#
+# ralph - Claude Code bead worker loop (YOLO mode)
+#
+# Autonomous bead worker: picks up ready work, completes it, commits, then
+# loops to the next bead. Fully autonomous - no prompts.
+#
+# Usage:
+#   ralph [--label <label>] [--max <n>] [--model <model>] [--retries <n>]
+#   ralph --queue "id:model,id:model,..."
+#
+# Options:
+#   --label <label>   Filter beads by label (works on any beads if omitted)
+#   --max <n>         Maximum iterations (default: unlimited)
+#   --model <model>   Model: haiku, sonnet, opus (default: haiku)
+#   --retries <n>     Max retries per bead (default: 5)
+#   --queue <spec>    Explicit queue with per-bead models (format: id:model,id:model,...)
+#
+
+set -euo pipefail
+
+# Valid model aliases (Claude CLI accepts these directly)
+VALID_MODELS="haiku sonnet opus"
+
+is_valid_model() {
+  local model="$1"
+  [[ " $VALID_MODELS " == *" $model "* ]]
+}
+
+# Defaults
+LABEL=""
+MAX_ITERATIONS=0  # 0 = unlimited
+MODEL="haiku"
+MAX_RETRIES=5
+QUEUE=""
+
+# Help text
+show_help() {
+  cat <<EOF
+ralph - Claude Code bead worker loop (YOLO mode)
+
+Autonomous bead worker: picks up ready work, completes it, commits, then
+loops to the next bead. Fully autonomous - no confirmation prompts.
+
+Usage:
+  ralph [options]
+
+Options:
+  --label <label>   Filter beads by label (works on any beads if omitted)
+  --max <n>         Maximum iterations (default: unlimited)
+  --model <model>   Model: haiku, sonnet, opus (default: haiku)
+  --retries <n>     Max retries per bead if context exhausted (default: 5)
+  --queue <spec>    Explicit bead queue with per-bead models
+                    Format: id:model,id:model,...
+                    Model defaults to --model if omitted (id only)
+  -h, --help        Show this help
+
+Examples:
+  ralph --label api-cleanup --max 10
+  ralph --label bug --model sonnet --retries 3
+  ralph  # Works on any ready beads
+
+  # Queue mode: process specific beads with specific models
+  ralph --queue "bd-21cp:sonnet,bd-35y4:opus,bd-1lzt:sonnet"
+  ralph --queue "bd-abc,bd-def" --model haiku  # All use haiku
+
+Requirements:
+  - Claude CLI (claude) installed and authenticated
+  - beads_rust (br) installed: https://github.com/sasha-incorporated/beads_rust
+  - Run from a directory with .beads/issues.jsonl (or parent)
+
+Install:
+  curl -fsSL https://raw.githubusercontent.com/sasha-incorporated/ralph/main/ralph -o ~/.local/bin/ralph
+  chmod +x ~/.local/bin/ralph
+EOF
+  exit 0
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --label)
+      LABEL="$2"
+      shift 2
+      ;;
+    --max)
+      MAX_ITERATIONS="$2"
+      shift 2
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --retries)
+      MAX_RETRIES="$2"
+      shift 2
+      ;;
+    --queue)
+      QUEUE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      show_help
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Use --help for usage information."
+      exit 1
+      ;;
+  esac
+done
+
+# Validate default model
+if ! is_valid_model "$MODEL"; then
+  echo "Error: Invalid model '$MODEL'. Must be one of: $VALID_MODELS"
+  exit 1
+fi
+
+# Check for br command
+if ! command -v br &> /dev/null; then
+  echo "Error: 'br' (beads_rust) not found. Install from: https://github.com/sasha-incorporated/beads_rust"
+  exit 1
+fi
+
+# Check for claude command
+if ! command -v claude &> /dev/null; then
+  echo "Error: 'claude' CLI not found. Install from: https://docs.anthropic.com/en/docs/claude-cli"
+  exit 1
+fi
+
+# Parse queue if provided (using parallel arrays for bash 3.x compatibility)
+QUEUE_IDS=()
+QUEUE_MODELS_LIST=()
+
+if [[ -n "$QUEUE" ]]; then
+  # Parse comma-separated items
+  IFS=',' read -ra QUEUE_ITEMS <<< "$QUEUE"
+  for item in "${QUEUE_ITEMS[@]}"; do
+    # Trim whitespace
+    item=$(echo "$item" | xargs)
+    if [[ "$item" == *":"* ]]; then
+      # Format: id:model
+      bead_id="${item%%:*}"
+      bead_model="${item#*:}"
+      if ! is_valid_model "$bead_model"; then
+        echo "Error: Invalid model '$bead_model' for bead '$bead_id'. Must be one of: $VALID_MODELS"
+        exit 1
+      fi
+    else
+      # Format: id only, use default model
+      bead_id="$item"
+      bead_model="$MODEL"
+    fi
+    QUEUE_IDS+=("$bead_id")
+    QUEUE_MODELS_LIST+=("$bead_model")
+  done
+  
+  # Set max iterations to queue length if not explicitly set
+  if [[ "$MAX_ITERATIONS" -eq 0 ]]; then
+    MAX_ITERATIONS=${#QUEUE_IDS[@]}
+  fi
+fi
+
+echo "=== Ralph Starting ==="
+if [[ -n "$QUEUE" ]]; then
+  echo "Mode: Queue (${#QUEUE_IDS[@]} beads)"
+  for i in "${!QUEUE_IDS[@]}"; do
+    echo "  - ${QUEUE_IDS[$i]} (${QUEUE_MODELS_LIST[$i]})"
+  done
+else
+  echo "Mode: Auto-discovery"
+  echo "Default model: $MODEL"
+  [[ -n "$LABEL" ]] && echo "Label filter: $LABEL"
+fi
+[[ "$MAX_ITERATIONS" -gt 0 ]] && echo "Max iterations: $MAX_ITERATIONS"
+echo "Max retries per bead: $MAX_RETRIES"
+echo ""
+
+# Main loop
+ITERATION=0
+COMPLETED=0
+QUEUE_INDEX=0
+
+while true; do
+  ITERATION=$((ITERATION + 1))
+
+  # Check iteration limit
+  if [[ "$MAX_ITERATIONS" -gt 0 && "$ITERATION" -gt "$MAX_ITERATIONS" ]]; then
+    echo ""
+    echo "=== Reached maximum iterations ($MAX_ITERATIONS). Completed $COMPLETED beads. ==="
+    exit 0
+  fi
+
+  # zero-pad ITERATION to 3 digits
+  itr=$(printf "%03d" $ITERATION)
+  echo ""
+  echo "==============================================="
+  echo "===              Iteration $itr              ==="
+  echo "===  Started: $(date)  ==="
+  echo "==============================================="
+
+  # Get next bead - either from queue or auto-discovery
+  if [[ -n "$QUEUE" ]]; then
+    # Queue mode: get next bead from queue
+    if [[ "$QUEUE_INDEX" -ge "${#QUEUE_IDS[@]}" ]]; then
+      echo "Queue exhausted."
+      echo ""
+      echo "=== All done! Completed $COMPLETED beads from queue. ==="
+      exit 0
+    fi
+    
+    BEAD_ID="${QUEUE_IDS[$QUEUE_INDEX]}"
+    CURRENT_MODEL="${QUEUE_MODELS_LIST[$QUEUE_INDEX]}"
+    QUEUE_INDEX=$((QUEUE_INDEX + 1))
+    
+    echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
+    
+    # Fetch bead details
+    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo "[]")
+    BEAD_COUNT=$(echo "$BEAD_JSON" | jq 'length')
+    
+    if [[ "$BEAD_COUNT" -eq 0 ]]; then
+      echo "⚠ Bead $BEAD_ID not found, skipping..."
+      continue
+    fi
+    
+    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.[0].title')
+    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.[0].description // "No description"')
+  else
+    # Auto-discovery mode: find next ready bead
+    CURRENT_MODEL="$MODEL"
+    
+    echo "Looking for ready work..."
+    if [[ -n "$LABEL" ]]; then
+      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo "[]")
+    else
+      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo "[]")
+    fi
+
+    # Check if there are any beads
+    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq 'length')
+    if [[ "$BEAD_COUNT" -eq 0 ]]; then
+      echo "No ready beads found${LABEL:+ with label '$LABEL'}."
+      echo ""
+      echo "=== All done! Completed $COMPLETED beads in $((ITERATION - 1)) iterations. ==="
+      exit 0
+    fi
+
+    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.[0].id')
+    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.[0].title')
+    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.[0].description // "No description"')
+  fi
+
+  echo "Bead: $BEAD_ID"
+  echo "Title: $BEAD_TITLE"
+  echo "Model: $CURRENT_MODEL"
+
+  # Double-check bead is still open (race condition protection)
+  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+  if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
+    echo "⚠ Bead already closed, skipping to next..."
+    continue
+  fi
+  echo ""
+
+  # Retry loop for this bead
+  RETRY=0
+  BEAD_DONE=false
+
+  while [[ "$RETRY" -lt "$MAX_RETRIES" && "$BEAD_DONE" == "false" ]]; do
+    RETRY=$((RETRY + 1))
+
+    if [[ "$RETRY" -gt 1 ]]; then
+      echo ""
+      echo "--- Retry $RETRY/$MAX_RETRIES for $BEAD_ID ---"
+    fi
+
+    # Build the prompt for Claude
+    RETRY_NOTE=""
+    if [[ "$RETRY" -gt 1 ]]; then
+      RETRY_NOTE="
+**NOTE: This is retry attempt $RETRY of $MAX_RETRIES.** A previous agent ran out of context or failed. Pick up where they left off - check git status, review any partial work, and complete the task.
+"
+    fi
+
+    PROMPT=$(cat <<EOF
+You are Ralph, an autonomous bead worker. Complete this bead and commit your work.
+
+## Current Bead: $BEAD_ID
+
+**Title:** $BEAD_TITLE
+**Model:** $CURRENT_MODEL
+$RETRY_NOTE
+**Description:**
+$BEAD_DESC
+
+## Your Mission
+
+1. **Understand** - Read the bead carefully, including any acceptance criteria
+2. **Execute** - Make all code changes needed to satisfy requirements
+3. **Verify** - Run tests/lint to ensure acceptance criteria pass
+4. **Close** - Run: \`br close $BEAD_ID\`
+5. **Commit** - Stage and commit with a meaningful message
+
+## Rules
+
+- Complete the bead FULLY before closing
+- If you CANNOT complete it (blocked, unclear requirements), leave a note in the bead description and do NOT close it
+- ALWAYS commit your work before finishing
+- Work ONLY on this bead, nothing else
+
+GO!
+EOF
+    )
+
+    # Invoke Claude Code (don't use exec - we need to continue the loop!)
+    echo "Invoking Claude Code with model: $CURRENT_MODEL..."
+    echo ""
+
+    set +e
+    claude --model "$CURRENT_MODEL" --print --dangerously-skip-permissions "$PROMPT"
+    CLAUDE_EXIT=$?
+    set -e
+
+    echo ""
+    echo "--- Claude exited with code: $CLAUDE_EXIT ---"
+
+    # Check if bead was closed
+    sleep 2  # Give br a moment to sync
+    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+    echo "Bead status: $BEAD_STATUS"
+
+    if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
+      echo "✓ Bead $BEAD_ID completed successfully!"
+      BEAD_DONE=true
+      COMPLETED=$((COMPLETED + 1))
+    elif [[ "$RETRY" -ge "$MAX_RETRIES" ]]; then
+      echo "✗ Bead $BEAD_ID failed after $MAX_RETRIES attempts. Skipping."
+    else
+      echo "Bead not closed. Will retry..."
+      sleep 3
+    fi
+  done
+done
