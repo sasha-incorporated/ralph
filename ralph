@@ -29,7 +29,7 @@ is_valid_model() {
 
 # Defaults
 LABEL=""
-MAX_ITERATIONS=0  # 0 = unlimited
+MAX_ITERATIONS="unlimited"
 MODEL="haiku"
 MAX_RETRIES=5
 QUEUE=""
@@ -47,7 +47,7 @@ Usage:
 
 Options:
   --label <label>   Filter beads by label (works on any beads if omitted)
-  --max <n>         Maximum iterations (default: unlimited)
+  --max <n>         Maximum iterations: number or "unlimited" (default: unlimited)
   --model <model>   Model: haiku, sonnet, opus (default: haiku)
   --retries <n>     Max retries per bead if context exhausted (default: 5)
   --queue <spec>    Explicit bead queue with per-bead models
@@ -154,9 +154,9 @@ if [[ -n "$QUEUE" ]]; then
     QUEUE_IDS+=("$bead_id")
     QUEUE_MODELS_LIST+=("$bead_model")
   done
-  
+
   # Set max iterations to queue length if not explicitly set
-  if [[ "$MAX_ITERATIONS" -eq 0 ]]; then
+  if [[ "$MAX_ITERATIONS" == "unlimited" ]]; then
     MAX_ITERATIONS=${#QUEUE_IDS[@]}
   fi
 fi
@@ -172,7 +172,7 @@ else
   echo "Default model: $MODEL"
   [[ -n "$LABEL" ]] && echo "Label filter: $LABEL"
 fi
-[[ "$MAX_ITERATIONS" -gt 0 ]] && echo "Max iterations: $MAX_ITERATIONS"
+[[ "$MAX_ITERATIONS" != "unlimited" ]] && echo "Max iterations: $MAX_ITERATIONS"
 echo "Max retries per bead: $MAX_RETRIES"
 echo ""
 
@@ -185,7 +185,7 @@ while true; do
   ITERATION=$((ITERATION + 1))
 
   # Check iteration limit
-  if [[ "$MAX_ITERATIONS" -gt 0 && "$ITERATION" -gt "$MAX_ITERATIONS" ]]; then
+  if [[ "$MAX_ITERATIONS" != "unlimited" && "$ITERATION" -gt "$MAX_ITERATIONS" ]]; then
     echo ""
     echo "=== Reached maximum iterations ($MAX_ITERATIONS). Completed $COMPLETED beads. ==="
     exit 0
@@ -208,28 +208,28 @@ while true; do
       echo "=== All done! Completed $COMPLETED beads from queue. ==="
       exit 0
     fi
-    
+
     BEAD_ID="${QUEUE_IDS[$QUEUE_INDEX]}"
     CURRENT_MODEL="${QUEUE_MODELS_LIST[$QUEUE_INDEX]}"
     QUEUE_INDEX=$((QUEUE_INDEX + 1))
-    
+
     echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
-    
+
     # Fetch bead details
     BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo "[]")
     BEAD_COUNT=$(echo "$BEAD_JSON" | jq 'length')
-    
+
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "⚠ Bead $BEAD_ID not found, skipping..."
       continue
     fi
-    
+
     BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.[0].title')
     BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.[0].description // "No description"')
   else
     # Auto-discovery mode: find next ready bead
     CURRENT_MODEL="$MODEL"
-    
+
     echo "Looking for ready work..."
     if [[ -n "$LABEL" ]]; then
       READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo "[]")
