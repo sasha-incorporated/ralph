@@ -216,29 +216,29 @@ while true; do
     echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
 
     # Fetch bead details
-    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo "[]")
-    BEAD_COUNT=$(echo "$BEAD_JSON" | jq 'length')
+    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo '{"data":{"issues":[]}}')
+    BEAD_COUNT=$(echo "$BEAD_JSON" | jq '.data.issues | length')
 
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "⚠ Bead $BEAD_ID not found, skipping..."
       continue
     fi
 
-    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.[0].title')
-    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.[0].description // "No description"')
+    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].title')
+    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].description // "No description"')
   else
     # Auto-discovery mode: find next ready bead
     CURRENT_MODEL="$MODEL"
 
     echo "Looking for ready work..."
     if [[ -n "$LABEL" ]]; then
-      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo "[]")
+      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     else
-      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo "[]")
+      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     fi
 
     # Check if there are any beads
-    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq 'length')
+    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq '.data.issues | length')
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "No ready beads found${LABEL:+ with label '$LABEL'}."
       echo ""
@@ -246,9 +246,9 @@ while true; do
       exit 0
     fi
 
-    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.[0].id')
-    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.[0].title')
-    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.[0].description // "No description"')
+    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].id')
+    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].title')
+    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].description // "No description"')
   fi
 
   echo "Bead: $BEAD_ID"
@@ -256,7 +256,7 @@ while true; do
   echo "Model: $CURRENT_MODEL"
 
   # Double-check bead is still open (race condition protection)
-  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.data.issues[0].status' || echo "unknown")
   if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
     echo "⚠ Bead already closed, skipping to next..."
     continue
@@ -327,7 +327,7 @@ EOF
 
     # Check if bead was closed
     sleep 2  # Give br a moment to sync
-    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.data.issues[0].status' || echo "unknown")
     echo "Bead status: $BEAD_STATUS"
 
     if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
