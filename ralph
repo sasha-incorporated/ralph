@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# ralph - Claude Code bead worker loop (YOLO mode)
+# ralph - AI bead worker loop (YOLO mode)
 #
 # Autonomous bead worker: picks up ready work, completes it, commits, then
-# loops to the next bead. Fully autonomous - no prompts.
+# loops to the next bead. Routes to Claude CLI or Cursor agent based on model.
+# Beads with a model:<name> label automatically use that model.
 #
 # Usage:
 #   ralph [--label <label>] [--max <n>] [--model <model>] [--retries <n>]
@@ -12,19 +13,38 @@
 # Options:
 #   --label <label>   Filter beads by label (works on any beads if omitted)
 #   --max <n>         Maximum iterations (default: unlimited)
-#   --model <model>   Model: haiku, sonnet, opus (default: haiku)
+#   --model <model>   Default model (default: haiku). Claude models (haiku,
+#                     sonnet, opus) use Claude CLI; others use Cursor agent.
 #   --retries <n>     Max retries per bead (default: 5)
 #   --queue <spec>    Explicit queue with per-bead models (format: id:model,id:model,...)
 #
 
 set -euo pipefail
 
-# Valid model aliases (Claude CLI accepts these directly)
-VALID_MODELS="haiku sonnet opus"
+# Models that use Claude CLI; everything else routes to cursor agent
+CLAUDE_MODELS="haiku sonnet opus"
 
-is_valid_model() {
+is_claude_model() {
+  [[ " $CLAUDE_MODELS " == *" $1 "* ]]
+}
+
+# Extract model from bead labels (looks for model:<name> label)
+# Returns the model name or empty string if no model label found
+extract_model_from_labels() {
+  local labels_json="$1"
+  echo "$labels_json" | jq -r '.[] | select(startswith("model:")) | sub("^model:"; "")' 2>/dev/null | head -1
+}
+
+# Invoke the right CLI based on model type
+invoke_model() {
   local model="$1"
-  [[ " $VALID_MODELS " == *" $model "* ]]
+  local prompt="$2"
+
+  if is_claude_model "$model"; then
+    claude --model "$model" --print --dangerously-skip-permissions "$prompt" < /dev/null
+  else
+    cursor agent --model "$model" --print --yolo --trust "$prompt" < /dev/null
+  fi
 }
 
 # Defaults
@@ -37,10 +57,16 @@ QUEUE=""
 # Help text
 show_help() {
   cat <<EOF
-ralph - Claude Code bead worker loop (YOLO mode)
+ralph - AI bead worker loop (YOLO mode)
 
 Autonomous bead worker: picks up ready work, completes it, commits, then
 loops to the next bead. Fully autonomous - no confirmation prompts.
+
+Routes to the right CLI based on model:
+  - Claude models (haiku, sonnet, opus) → Claude CLI
+  - Everything else (gpt-5, chatgpt-5.3, ...) → Cursor agent
+
+Beads with a model:<name> label automatically use that model.
 
 Usage:
   ralph [options]
@@ -48,24 +74,30 @@ Usage:
 Options:
   --label <label>   Filter beads by label (works on any beads if omitted)
   --max <n>         Maximum iterations: number or "unlimited" (default: unlimited)
-  --model <model>   Model: haiku, sonnet, opus (default: haiku)
+  --model <model>   Default model (default: haiku). Claude models use Claude CLI;
+                    others use Cursor agent CLI.
   --retries <n>     Max retries per bead if context exhausted (default: 5)
   --queue <spec>    Explicit bead queue with per-bead models
                     Format: id:model,id:model,...
-                    Model defaults to --model if omitted (id only)
+                    Model defaults to bead label, then --model if omitted
   -h, --help        Show this help
 
 Examples:
   ralph --label api-cleanup --max 10
   ralph --label bug --model sonnet --retries 3
+  ralph --model chatgpt-5.3           # Use ChatGPT via Cursor agent
   ralph  # Works on any ready beads
 
   # Queue mode: process specific beads with specific models
-  ralph --queue "bd-21cp:sonnet,bd-35y4:opus,bd-1lzt:sonnet"
+  ralph --queue "bd-21cp:sonnet,bd-35y4:chatgpt-5.3,bd-1lzt:opus"
   ralph --queue "bd-abc,bd-def" --model haiku  # All use haiku
 
+  # Bead labels: add model:opus to a bead and ralph auto-selects it
+  br label add bd-21cp model:opus
+
 Requirements:
-  - Claude CLI (claude) installed and authenticated
+  - Claude CLI (claude) for Claude models: https://docs.anthropic.com/en/docs/claude-cli
+  - Cursor CLI (cursor) for other models: https://cursor.com/cli
   - beads_rust (br) installed: https://github.com/sasha-incorporated/beads_rust
   - Run from a directory with .beads/issues.jsonl (or parent)
 
@@ -110,22 +142,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Validate default model
-if ! is_valid_model "$MODEL"; then
-  echo "Error: Invalid model '$MODEL'. Must be one of: $VALID_MODELS"
-  exit 1
-fi
-
 # Check for br command
 if ! command -v br &> /dev/null; then
   echo "Error: 'br' (beads_rust) not found. Install from: https://github.com/sasha-incorporated/beads_rust"
   exit 1
 fi
 
-# Check for claude command
-if ! command -v claude &> /dev/null; then
-  echo "Error: 'claude' CLI not found. Install from: https://docs.anthropic.com/en/docs/claude-cli"
-  exit 1
+# Check for CLI tools based on default model
+if is_claude_model "$MODEL"; then
+  if ! command -v claude &> /dev/null; then
+    echo "Error: 'claude' CLI not found (needed for model '$MODEL')."
+    echo "Install from: https://docs.anthropic.com/en/docs/claude-cli"
+    exit 1
+  fi
+else
+  if ! command -v cursor &> /dev/null; then
+    echo "Error: 'cursor' CLI not found (needed for model '$MODEL')."
+    echo "Install from: https://cursor.com/cli"
+    exit 1
+  fi
 fi
 
 # Parse queue if provided (using parallel arrays for bash 3.x compatibility)
@@ -139,17 +174,13 @@ if [[ -n "$QUEUE" ]]; then
     # Trim whitespace
     item=$(echo "$item" | xargs)
     if [[ "$item" == *":"* ]]; then
-      # Format: id:model
+      # Format: id:model (explicit model override)
       bead_id="${item%%:*}"
       bead_model="${item#*:}"
-      if ! is_valid_model "$bead_model"; then
-        echo "Error: Invalid model '$bead_model' for bead '$bead_id'. Must be one of: $VALID_MODELS"
-        exit 1
-      fi
     else
-      # Format: id only, use default model
+      # Format: id only — will check bead labels later, then fall back to --model
       bead_id="$item"
-      bead_model="$MODEL"
+      bead_model=""
     fi
     QUEUE_IDS+=("$bead_id")
     QUEUE_MODELS_LIST+=("$bead_model")
@@ -165,7 +196,8 @@ echo "=== Ralph Starting ==="
 if [[ -n "$QUEUE" ]]; then
   echo "Mode: Queue (${#QUEUE_IDS[@]} beads)"
   for i in "${!QUEUE_IDS[@]}"; do
-    echo "  - ${QUEUE_IDS[$i]} (${QUEUE_MODELS_LIST[$i]})"
+    local_model="${QUEUE_MODELS_LIST[$i]}"
+    echo "  - ${QUEUE_IDS[$i]} (${local_model:-auto})"
   done
 else
   echo "Mode: Auto-discovery"
@@ -213,8 +245,6 @@ while true; do
     CURRENT_MODEL="${QUEUE_MODELS_LIST[$QUEUE_INDEX]}"
     QUEUE_INDEX=$((QUEUE_INDEX + 1))
 
-    echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
-
     # Fetch bead details
     BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     BEAD_COUNT=$(echo "$BEAD_JSON" | jq '.data.issues | length')
@@ -226,10 +256,22 @@ while true; do
 
     BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].title')
     BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].description // "No description"')
+
+    # Resolve model: queue explicit > bead label > --model default
+    if [[ -z "$CURRENT_MODEL" ]]; then
+      LABEL_MODEL=$(extract_model_from_labels "$(echo "$BEAD_JSON" | jq '.data.issues[0].labels // []')")
+      if [[ -n "$LABEL_MODEL" ]]; then
+        CURRENT_MODEL="$LABEL_MODEL"
+        echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL ← bead label)"
+      else
+        CURRENT_MODEL="$MODEL"
+        echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL ← default)"
+      fi
+    else
+      echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
+    fi
   else
     # Auto-discovery mode: find next ready bead
-    CURRENT_MODEL="$MODEL"
-
     echo "Looking for ready work..."
     if [[ -n "$LABEL" ]]; then
       READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
@@ -249,6 +291,15 @@ while true; do
     BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].id')
     BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].title')
     BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].description // "No description"')
+
+    # Check bead labels for model override
+    LABEL_MODEL=$(extract_model_from_labels "$(echo "$READY_OUTPUT" | jq '.data.issues[0].labels // []')")
+    if [[ -n "$LABEL_MODEL" ]]; then
+      CURRENT_MODEL="$LABEL_MODEL"
+      echo "Model from bead label: $CURRENT_MODEL"
+    else
+      CURRENT_MODEL="$MODEL"
+    fi
   fi
 
   echo "Bead: $BEAD_ID"
@@ -275,7 +326,7 @@ while true; do
       echo "--- Retry $RETRY/$MAX_RETRIES for $BEAD_ID ---"
     fi
 
-    # Build the prompt for Claude
+    # Build the prompt
     RETRY_NOTE=""
     if [[ "$RETRY" -gt 1 ]]; then
       RETRY_NOTE="
@@ -313,17 +364,21 @@ GO!
 EOF
     )
 
-    # Invoke Claude Code (don't use exec - we need to continue the loop!)
-    echo "Invoking Claude Code with model: $CURRENT_MODEL..."
+    # Invoke the model (routes to Claude CLI or Cursor agent)
+    if is_claude_model "$CURRENT_MODEL"; then
+      echo "Invoking Claude CLI with model: $CURRENT_MODEL..."
+    else
+      echo "Invoking Cursor agent with model: $CURRENT_MODEL..."
+    fi
     echo ""
 
     set +e
-    claude --model "$CURRENT_MODEL" --print --dangerously-skip-permissions "$PROMPT" < /dev/null
-    CLAUDE_EXIT=$?
+    invoke_model "$CURRENT_MODEL" "$PROMPT"
+    AGENT_EXIT=$?
     set -e
 
     echo ""
-    echo "--- Claude exited with code: $CLAUDE_EXIT ---"
+    echo "--- Agent exited with code: $AGENT_EXIT ---"
 
     # Check if bead was closed
     sleep 2  # Give br a moment to sync
