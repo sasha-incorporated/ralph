@@ -19,6 +19,7 @@
 #                     sonnet, opus) use Claude CLI; others use Cursor agent.
 #   --retries <n>     Max retries per bead (default: 5)
 #   --queue <spec>    Explicit queue with per-bead models (format: id:model,id:model,...)
+#   --timeout <sec>   Per-bead timeout in seconds (default: 900 = 15min)
 #   --progress        Show progress summary of current/last run
 #   --output          Show full output log of current/last run
 #   --tail            With --output: follow the log in real-time (like tail -f)
@@ -35,6 +36,18 @@ CLAUDE_MODELS="haiku sonnet opus"
 # Log directory
 DEFAULT_LOG_DIR="${HOME}/.ralph/logs"
 
+# Default per-bead timeout (15 minutes)
+DEFAULT_TIMEOUT=900
+
+# Find timeout command (macOS coreutils uses gtimeout)
+if command -v timeout &> /dev/null; then
+  TIMEOUT_CMD="timeout"
+elif command -v gtimeout &> /dev/null; then
+  TIMEOUT_CMD="gtimeout"
+else
+  TIMEOUT_CMD=""
+fi
+
 # --- Helpers ---
 
 is_claude_model() {
@@ -47,15 +60,20 @@ extract_model_from_labels() {
   echo "$labels_json" | jq -r '.[] | select(startswith("model:")) | sub("^model:"; "")' 2>/dev/null | head -1
 }
 
-# Invoke the right CLI based on model type
+# Invoke the right CLI based on model type, with optional timeout
 invoke_model() {
   local model="$1"
   local prompt="$2"
+  local timeout_prefix=""
+
+  if [[ -n "$TIMEOUT_CMD" && "$BEAD_TIMEOUT" -gt 0 ]]; then
+    timeout_prefix="$TIMEOUT_CMD --signal=TERM --kill-after=30 ${BEAD_TIMEOUT}"
+  fi
 
   if is_claude_model "$model"; then
-    claude --model "$model" --print --dangerously-skip-permissions "$prompt" < /dev/null
+    $timeout_prefix claude --model "$model" --print --dangerously-skip-permissions "$prompt" < /dev/null
   else
-    cursor agent --model "$model" --print --yolo --trust "$prompt" < /dev/null
+    $timeout_prefix cursor agent --model "$model" --print --yolo --trust "$prompt" < /dev/null
   fi
 }
 
@@ -179,6 +197,7 @@ MAX_ITERATIONS="unlimited"
 MODEL="haiku"
 MAX_RETRIES=5
 QUEUE=""
+BEAD_TIMEOUT="$DEFAULT_TIMEOUT"
 LOG_DIR="$DEFAULT_LOG_DIR"
 SHOW_PROGRESS=false
 SHOW_OUTPUT=false
@@ -208,6 +227,8 @@ Options:
   --model <model>   Default model (default: haiku). Claude models use Claude CLI;
                     others use Cursor agent CLI.
   --retries <n>     Max retries per bead if context exhausted (default: 5)
+  --timeout <sec>   Per-bead timeout in seconds (default: 900 = 15min).
+                    If an agent hangs, it's killed and the bead retries.
   --queue <spec>    Explicit bead queue with per-bead models
                     Format: id:model,id:model,...
                     Model defaults to bead label, then --model if omitted
@@ -270,6 +291,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --queue)
       QUEUE="$2"
+      shift 2
+      ;;
+    --timeout)
+      BEAD_TIMEOUT="$2"
       shift 2
       ;;
     --progress)
@@ -377,6 +402,11 @@ else
 fi
 [[ "$MAX_ITERATIONS" != "unlimited" ]] && echo "Max iterations: $MAX_ITERATIONS"
 echo "Max retries per bead: $MAX_RETRIES"
+if [[ -n "$TIMEOUT_CMD" ]]; then
+  echo "Per-bead timeout: ${BEAD_TIMEOUT}s"
+else
+  echo "Per-bead timeout: disabled (install coreutils for timeout support)"
+fi
 echo "Log: $LOG_FILE"
 echo "Progress: ralph --progress"
 echo ""
@@ -563,7 +593,11 @@ EOF
     set -e
 
     echo ""
-    echo "--- Agent exited with code: $AGENT_EXIT ---"
+    if [[ "$AGENT_EXIT" -eq 124 ]]; then
+      echo "--- Agent TIMED OUT after ${BEAD_TIMEOUT}s (killed) ---"
+    else
+      echo "--- Agent exited with code: $AGENT_EXIT ---"
+    fi
 
     sleep 2
     BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
