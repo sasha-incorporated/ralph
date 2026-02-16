@@ -9,6 +9,8 @@
 # Usage:
 #   ralph [--label <label>] [--max <n>] [--model <model>] [--retries <n>]
 #   ralph --queue "id:model,id:model,..."
+#   ralph --progress          # Show progress of current/last run
+#   ralph --output [--tail]   # Show full output or tail it
 #
 # Options:
 #   --label <label>   Filter beads by label (works on any beads if omitted)
@@ -17,19 +19,29 @@
 #                     sonnet, opus) use Claude CLI; others use Cursor agent.
 #   --retries <n>     Max retries per bead (default: 5)
 #   --queue <spec>    Explicit queue with per-bead models (format: id:model,id:model,...)
+#   --progress        Show progress summary of current/last run
+#   --output          Show full output log of current/last run
+#   --tail            With --output: follow the log in real-time (like tail -f)
+#   --log-dir <dir>   Custom log directory (default: ~/.ralph/logs)
 #
 
 set -euo pipefail
 
+# --- Constants ---
+
 # Models that use Claude CLI; everything else routes to cursor agent
 CLAUDE_MODELS="haiku sonnet opus"
+
+# Log directory
+DEFAULT_LOG_DIR="${HOME}/.ralph/logs"
+
+# --- Helpers ---
 
 is_claude_model() {
   [[ " $CLAUDE_MODELS " == *" $1 "* ]]
 }
 
 # Extract model from bead labels (looks for model:<name> label)
-# Returns the model name or empty string if no model label found
 extract_model_from_labels() {
   local labels_json="$1"
   echo "$labels_json" | jq -r '.[] | select(startswith("model:")) | sub("^model:"; "")' 2>/dev/null | head -1
@@ -47,14 +59,133 @@ invoke_model() {
   fi
 }
 
-# Defaults
+# --- Logging ---
+
+setup_logging() {
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="$LOG_DIR/latest.log"
+  PROGRESS_FILE="$LOG_DIR/progress.json"
+
+  # Initialize progress file
+  cat > "$PROGRESS_FILE" <<PEOF
+{
+  "status": "starting",
+  "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "pid": $$,
+  "completed": 0,
+  "failed": 0,
+  "skipped": 0,
+  "total": 0,
+  "current_bead": null,
+  "current_model": null,
+  "current_iteration": 0,
+  "beads": []
+}
+PEOF
+}
+
+update_progress() {
+  local updates="$1"
+  local tmp_file="${PROGRESS_FILE}.tmp"
+  jq "$updates" "$PROGRESS_FILE" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$PROGRESS_FILE"
+}
+
+record_bead_result() {
+  local bead_id="$1"
+  local title="$2"
+  local model="$3"
+  local result="$4"  # completed|failed|skipped
+  local tmp_file="${PROGRESS_FILE}.tmp"
+  jq --arg id "$bead_id" --arg t "$title" --arg m "$model" --arg r "$result" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.beads += [{"id": $id, "title": $t, "model": $m, "result": $r, "finished_at": $ts}]' \
+    "$PROGRESS_FILE" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$PROGRESS_FILE"
+}
+
+# --- Progress / Output commands ---
+
+show_progress() {
+  local pfile="$LOG_DIR/progress.json"
+  if [[ ! -f "$pfile" ]]; then
+    echo "No ralph run found. Log directory: $LOG_DIR"
+    exit 1
+  fi
+
+  echo "=== Ralph Progress ==="
+  echo ""
+
+  local status completed failed skipped total current_bead current_model started_at pid
+  status=$(jq -r '.status' "$pfile")
+  completed=$(jq -r '.completed' "$pfile")
+  failed=$(jq -r '.failed' "$pfile")
+  skipped=$(jq -r '.skipped' "$pfile")
+  total=$(jq -r '.total' "$pfile")
+  current_bead=$(jq -r '.current_bead // "none"' "$pfile")
+  current_model=$(jq -r '.current_model // "—"' "$pfile")
+  started_at=$(jq -r '.started_at' "$pfile")
+  pid=$(jq -r '.pid' "$pfile")
+
+  # Check if process is still running
+  local running="no"
+  if kill -0 "$pid" 2>/dev/null; then
+    running="yes"
+  fi
+
+  echo "Status:    $status (pid $pid, running: $running)"
+  echo "Started:   $started_at"
+  echo "Progress:  $completed completed, $failed failed, $skipped skipped / $total total"
+  if [[ "$current_bead" != "none" && "$current_bead" != "null" ]]; then
+    echo "Current:   $current_bead ($current_model)"
+  fi
+  echo ""
+
+  # Show bead results
+  local bead_count
+  bead_count=$(jq '.beads | length' "$pfile")
+  if [[ "$bead_count" -gt 0 ]]; then
+    echo "--- Bead Results ---"
+    jq -r '.beads[] | "  " + (if .result == "completed" then "✓" elif .result == "failed" then "✗" else "⊘" end) + " " + .id + " " + .result + " (" + .model + ") — " + .title' "$pfile"
+    echo ""
+  fi
+
+  # Show remaining queue items
+  local remaining=$((total - completed - failed - skipped))
+  if [[ "$remaining" -gt 0 ]]; then
+    echo "$remaining beads remaining"
+  fi
+
+  exit 0
+}
+
+show_output() {
+  local log="$LOG_DIR/latest.log"
+  if [[ ! -f "$log" ]]; then
+    echo "No ralph log found. Log directory: $LOG_DIR"
+    exit 1
+  fi
+
+  if [[ "$TAIL_MODE" == "true" ]]; then
+    echo "=== Following ralph output (Ctrl+C to stop) ==="
+    tail -f "$log"
+  else
+    cat "$log"
+  fi
+  exit 0
+}
+
+# --- Defaults ---
+
 LABEL=""
 MAX_ITERATIONS="unlimited"
 MODEL="haiku"
 MAX_RETRIES=5
 QUEUE=""
+LOG_DIR="$DEFAULT_LOG_DIR"
+SHOW_PROGRESS=false
+SHOW_OUTPUT=false
+TAIL_MODE=false
 
-# Help text
+# --- Help ---
+
 show_help() {
   cat <<EOF
 ralph - AI bead worker loop (YOLO mode)
@@ -80,6 +211,10 @@ Options:
   --queue <spec>    Explicit bead queue with per-bead models
                     Format: id:model,id:model,...
                     Model defaults to bead label, then --model if omitted
+  --progress        Show progress summary of current/last run
+  --output          Show full output log of current/last run
+  --tail            With --output: follow the log in real-time
+  --log-dir <dir>   Custom log directory (default: ~/.ralph/logs)
   -h, --help        Show this help
 
 Examples:
@@ -91,6 +226,11 @@ Examples:
   # Queue mode: process specific beads with specific models
   ralph --queue "bd-21cp:sonnet,bd-35y4:chatgpt-5.3,bd-1lzt:opus"
   ralph --queue "bd-abc,bd-def" --model haiku  # All use haiku
+
+  # Check on a running ralph from another terminal
+  ralph --progress                    # Summary: completed/failed/remaining
+  ralph --output                      # Full log output
+  ralph --output --tail               # Follow log in real-time
 
   # Bead labels: add model:opus to a bead and ralph auto-selects it
   br label add bd-21cp model:opus
@@ -108,7 +248,8 @@ EOF
   exit 0
 }
 
-# Parse arguments
+# --- Parse arguments ---
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --label)
@@ -131,6 +272,22 @@ while [[ $# -gt 0 ]]; do
       QUEUE="$2"
       shift 2
       ;;
+    --progress)
+      SHOW_PROGRESS=true
+      shift
+      ;;
+    --output)
+      SHOW_OUTPUT=true
+      shift
+      ;;
+    --tail)
+      TAIL_MODE=true
+      shift
+      ;;
+    --log-dir)
+      LOG_DIR="$2"
+      shift 2
+      ;;
     -h|--help)
       show_help
       ;;
@@ -142,7 +299,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Check for br command
+# Handle read-only commands (no need for br/claude checks)
+if [[ "$SHOW_PROGRESS" == "true" ]]; then
+  show_progress
+fi
+
+if [[ "$SHOW_OUTPUT" == "true" ]]; then
+  show_output
+fi
+
+# --- Pre-flight checks ---
+
 if ! command -v br &> /dev/null; then
   echo "Error: 'br' (beads_rust) not found. Install from: https://github.com/sasha-incorporated/beads_rust"
   exit 1
@@ -163,22 +330,19 @@ else
   fi
 fi
 
-# Parse queue if provided (using parallel arrays for bash 3.x compatibility)
+# --- Parse queue ---
+
 QUEUE_IDS=()
 QUEUE_MODELS_LIST=()
 
 if [[ -n "$QUEUE" ]]; then
-  # Parse comma-separated items
   IFS=',' read -ra QUEUE_ITEMS <<< "$QUEUE"
   for item in "${QUEUE_ITEMS[@]}"; do
-    # Trim whitespace
     item=$(echo "$item" | xargs)
     if [[ "$item" == *":"* ]]; then
-      # Format: id:model (explicit model override)
       bead_id="${item%%:*}"
       bead_model="${item#*:}"
     else
-      # Format: id only — will check bead labels later, then fall back to --model
       bead_id="$item"
       bead_model=""
     fi
@@ -186,11 +350,17 @@ if [[ -n "$QUEUE" ]]; then
     QUEUE_MODELS_LIST+=("$bead_model")
   done
 
-  # Set max iterations to queue length if not explicitly set
   if [[ "$MAX_ITERATIONS" == "unlimited" ]]; then
     MAX_ITERATIONS=${#QUEUE_IDS[@]}
   fi
 fi
+
+# --- Setup logging (tee all output to log file) ---
+
+setup_logging
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# --- Banner ---
 
 echo "=== Ralph Starting ==="
 if [[ -n "$QUEUE" ]]; then
@@ -199,6 +369,7 @@ if [[ -n "$QUEUE" ]]; then
     local_model="${QUEUE_MODELS_LIST[$i]}"
     echo "  - ${QUEUE_IDS[$i]} (${local_model:-auto})"
   done
+  update_progress ".total = ${#QUEUE_IDS[@]}"
 else
   echo "Mode: Auto-discovery"
   echo "Default model: $MODEL"
@@ -206,24 +377,30 @@ else
 fi
 [[ "$MAX_ITERATIONS" != "unlimited" ]] && echo "Max iterations: $MAX_ITERATIONS"
 echo "Max retries per bead: $MAX_RETRIES"
+echo "Log: $LOG_FILE"
+echo "Progress: ralph --progress"
 echo ""
 
-# Main loop
+update_progress '.status = "running"'
+
+# --- Main loop ---
+
 ITERATION=0
 COMPLETED=0
+FAILED=0
+SKIPPED=0
 QUEUE_INDEX=0
 
 while true; do
   ITERATION=$((ITERATION + 1))
 
-  # Check iteration limit
   if [[ "$MAX_ITERATIONS" != "unlimited" && "$ITERATION" -gt "$MAX_ITERATIONS" ]]; then
     echo ""
     echo "=== Reached maximum iterations ($MAX_ITERATIONS). Completed $COMPLETED beads. ==="
+    update_progress ".status = \"finished\" | .completed = $COMPLETED | .failed = $FAILED | .skipped = $SKIPPED"
     exit 0
   fi
 
-  # zero-pad ITERATION to 3 digits
   itr=$(printf "%03d" $ITERATION)
   echo ""
   echo "==============================================="
@@ -231,13 +408,14 @@ while true; do
   echo "===  Started: $(date)  ==="
   echo "==============================================="
 
-  # Get next bead - either from queue or auto-discovery
+  # --- Get next bead ---
+
   if [[ -n "$QUEUE" ]]; then
-    # Queue mode: get next bead from queue
     if [[ "$QUEUE_INDEX" -ge "${#QUEUE_IDS[@]}" ]]; then
       echo "Queue exhausted."
       echo ""
       echo "=== All done! Completed $COMPLETED beads from queue. ==="
+      update_progress ".status = \"finished\" | .completed = $COMPLETED | .failed = $FAILED | .skipped = $SKIPPED"
       exit 0
     fi
 
@@ -245,21 +423,23 @@ while true; do
     CURRENT_MODEL="${QUEUE_MODELS_LIST[$QUEUE_INDEX]}"
     QUEUE_INDEX=$((QUEUE_INDEX + 1))
 
-    # Fetch bead details
-    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo '{"data":{"issues":[]}}')
-    BEAD_COUNT=$(echo "$BEAD_JSON" | jq '.data.issues | length')
+    # br show --json returns a plain array: [{...}]
+    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo "[]")
+    BEAD_COUNT=$(echo "$BEAD_JSON" | jq 'length')
 
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "⚠ Bead $BEAD_ID not found, skipping..."
+      SKIPPED=$((SKIPPED + 1))
+      update_progress ".skipped = $SKIPPED | .current_iteration = $ITERATION"
       continue
     fi
 
-    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].title')
-    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.data.issues[0].description // "No description"')
+    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.[0].title')
+    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.[0].description // "No description"')
 
     # Resolve model: queue explicit > bead label > --model default
     if [[ -z "$CURRENT_MODEL" ]]; then
-      LABEL_MODEL=$(extract_model_from_labels "$(echo "$BEAD_JSON" | jq '.data.issues[0].labels // []')")
+      LABEL_MODEL=$(extract_model_from_labels "$(echo "$BEAD_JSON" | jq '.[0].labels // []')")
       if [[ -n "$LABEL_MODEL" ]]; then
         CURRENT_MODEL="$LABEL_MODEL"
         echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL ← bead label)"
@@ -271,29 +451,30 @@ while true; do
       echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL)"
     fi
   else
-    # Auto-discovery mode: find next ready bead
+    # Auto-discovery mode
     echo "Looking for ready work..."
     if [[ -n "$LABEL" ]]; then
-      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
+      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo "[]")
     else
-      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
+      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo "[]")
     fi
 
-    # Check if there are any beads
-    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq '.data.issues | length')
+    # br ready --json returns a plain array: [{...}]
+    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq 'length')
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "No ready beads found${LABEL:+ with label '$LABEL'}."
       echo ""
       echo "=== All done! Completed $COMPLETED beads in $((ITERATION - 1)) iterations. ==="
+      update_progress ".status = \"finished\" | .completed = $COMPLETED | .failed = $FAILED | .skipped = $SKIPPED"
       exit 0
     fi
 
-    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].id')
-    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].title')
-    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.data.issues[0].description // "No description"')
+    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.[0].id')
+    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.[0].title')
+    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.[0].description // "No description"')
 
     # Check bead labels for model override
-    LABEL_MODEL=$(extract_model_from_labels "$(echo "$READY_OUTPUT" | jq '.data.issues[0].labels // []')")
+    LABEL_MODEL=$(extract_model_from_labels "$(echo "$READY_OUTPUT" | jq '.[0].labels // []')")
     if [[ -n "$LABEL_MODEL" ]]; then
       CURRENT_MODEL="$LABEL_MODEL"
       echo "Model from bead label: $CURRENT_MODEL"
@@ -306,15 +487,21 @@ while true; do
   echo "Title: $BEAD_TITLE"
   echo "Model: $CURRENT_MODEL"
 
-  # Double-check bead is still open (race condition protection)
-  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.data.issues[0].status' || echo "unknown")
+  update_progress ".current_bead = \"$BEAD_ID\" | .current_model = \"$CURRENT_MODEL\" | .current_iteration = $ITERATION"
+
+  # Double-check bead is still open
+  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
   if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
     echo "⚠ Bead already closed, skipping to next..."
+    SKIPPED=$((SKIPPED + 1))
+    record_bead_result "$BEAD_ID" "$BEAD_TITLE" "$CURRENT_MODEL" "skipped"
+    update_progress ".skipped = $SKIPPED"
     continue
   fi
   echo ""
 
-  # Retry loop for this bead
+  # --- Retry loop ---
+
   RETRY=0
   BEAD_DONE=false
 
@@ -326,7 +513,6 @@ while true; do
       echo "--- Retry $RETRY/$MAX_RETRIES for $BEAD_ID ---"
     fi
 
-    # Build the prompt
     RETRY_NOTE=""
     if [[ "$RETRY" -gt 1 ]]; then
       RETRY_NOTE="
@@ -364,7 +550,6 @@ GO!
 EOF
     )
 
-    # Invoke the model (routes to Claude CLI or Cursor agent)
     if is_claude_model "$CURRENT_MODEL"; then
       echo "Invoking Claude CLI with model: $CURRENT_MODEL..."
     else
@@ -380,17 +565,21 @@ EOF
     echo ""
     echo "--- Agent exited with code: $AGENT_EXIT ---"
 
-    # Check if bead was closed
-    sleep 2  # Give br a moment to sync
-    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.data.issues[0].status' || echo "unknown")
+    sleep 2
+    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
     echo "Bead status: $BEAD_STATUS"
 
     if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
       echo "✓ Bead $BEAD_ID completed successfully!"
       BEAD_DONE=true
       COMPLETED=$((COMPLETED + 1))
+      record_bead_result "$BEAD_ID" "$BEAD_TITLE" "$CURRENT_MODEL" "completed"
+      update_progress ".completed = $COMPLETED | .current_bead = null"
     elif [[ "$RETRY" -ge "$MAX_RETRIES" ]]; then
       echo "✗ Bead $BEAD_ID failed after $MAX_RETRIES attempts. Skipping."
+      FAILED=$((FAILED + 1))
+      record_bead_result "$BEAD_ID" "$BEAD_TITLE" "$CURRENT_MODEL" "failed"
+      update_progress ".failed = $FAILED | .current_bead = null"
     else
       echo "Bead not closed. Will retry..."
       sleep 3
