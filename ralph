@@ -491,9 +491,16 @@ while true; do
       READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     fi
 
-    # br ready/list --json returns {"data":{"issues":[...]}} or a plain array
-    # Normalize: extract the issues array regardless of wrapper format
-    ISSUES=$(echo "$READY_OUTPUT" | jq 'if type == "array" then . elif .data.issues then .data.issues else [] end')
+    # Normalize output: br has multiple JSON formats depending on command/version:
+    #   br ready:  {"data":{"issues":[...]}}
+    #   br list:   {"data":[...]}
+    #   legacy:    [{...}]  (plain array)
+    ISSUES=$(echo "$READY_OUTPUT" | jq '
+      if type == "array" then .
+      elif (.data | type) == "array" then .data
+      elif .data.issues then .data.issues
+      else []
+      end')
     BEAD_COUNT=$(echo "$ISSUES" | jq 'length')
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "No ready beads found${LABEL:+ with label '$LABEL'}."
