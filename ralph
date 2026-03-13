@@ -453,23 +453,24 @@ while true; do
     CURRENT_MODEL="${QUEUE_MODELS_LIST[$QUEUE_INDEX]}"
     QUEUE_INDEX=$((QUEUE_INDEX + 1))
 
-    # br show --json returns a plain array: [{...}]
-    BEAD_JSON=$(br show "$BEAD_ID" --json 2>/dev/null || echo "[]")
-    BEAD_COUNT=$(echo "$BEAD_JSON" | jq 'length')
+    # br show --json returns {"data":{...}} or [{...}] depending on version
+    BEAD_JSON_RAW=$(br show "$BEAD_ID" --json 2>/dev/null || echo '{}')
+    # Normalize: extract the bead object regardless of wrapper format
+    BEAD_OBJ=$(echo "$BEAD_JSON_RAW" | jq 'if type == "array" then .[0] // null elif .data then .data else . end')
 
-    if [[ "$BEAD_COUNT" -eq 0 ]]; then
+    if [[ "$BEAD_OBJ" == "null" || -z "$BEAD_OBJ" ]]; then
       echo "⚠ Bead $BEAD_ID not found, skipping..."
       SKIPPED=$((SKIPPED + 1))
       update_progress ".skipped = $SKIPPED | .current_iteration = $ITERATION"
       continue
     fi
 
-    BEAD_TITLE=$(echo "$BEAD_JSON" | jq -r '.[0].title')
-    BEAD_DESC=$(echo "$BEAD_JSON" | jq -r '.[0].description // "No description"')
+    BEAD_TITLE=$(echo "$BEAD_OBJ" | jq -r '.title')
+    BEAD_DESC=$(echo "$BEAD_OBJ" | jq -r '.description // "No description"')
 
     # Resolve model: queue explicit > bead label > --model default
     if [[ -z "$CURRENT_MODEL" ]]; then
-      LABEL_MODEL=$(extract_model_from_labels "$(echo "$BEAD_JSON" | jq '.[0].labels // []')")
+      LABEL_MODEL=$(extract_model_from_labels "$(echo "$BEAD_OBJ" | jq '.labels // []')")
       if [[ -n "$LABEL_MODEL" ]]; then
         CURRENT_MODEL="$LABEL_MODEL"
         echo "Queue item $QUEUE_INDEX/${#QUEUE_IDS[@]}: $BEAD_ID (model: $CURRENT_MODEL ← bead label)"
@@ -484,13 +485,16 @@ while true; do
     # Auto-discovery mode
     echo "Looking for ready work..."
     if [[ -n "$LABEL" ]]; then
-      READY_OUTPUT=$(br ready --label "$LABEL" --limit 1 --json 2>/dev/null || echo "[]")
+      # br ready doesn't support --label, so use br list with status+label filter
+      READY_OUTPUT=$(br list --status open --label "$LABEL" --limit 1 --sort priority --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     else
-      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo "[]")
+      READY_OUTPUT=$(br ready --limit 1 --json 2>/dev/null || echo '{"data":{"issues":[]}}')
     fi
 
-    # br ready --json returns a plain array: [{...}]
-    BEAD_COUNT=$(echo "$READY_OUTPUT" | jq 'length')
+    # br ready/list --json returns {"data":{"issues":[...]}} or a plain array
+    # Normalize: extract the issues array regardless of wrapper format
+    ISSUES=$(echo "$READY_OUTPUT" | jq 'if type == "array" then . elif .data.issues then .data.issues else [] end')
+    BEAD_COUNT=$(echo "$ISSUES" | jq 'length')
     if [[ "$BEAD_COUNT" -eq 0 ]]; then
       echo "No ready beads found${LABEL:+ with label '$LABEL'}."
       echo ""
@@ -499,12 +503,12 @@ while true; do
       exit 0
     fi
 
-    BEAD_ID=$(echo "$READY_OUTPUT" | jq -r '.[0].id')
-    BEAD_TITLE=$(echo "$READY_OUTPUT" | jq -r '.[0].title')
-    BEAD_DESC=$(echo "$READY_OUTPUT" | jq -r '.[0].description // "No description"')
+    BEAD_ID=$(echo "$ISSUES" | jq -r '.[0].id')
+    BEAD_TITLE=$(echo "$ISSUES" | jq -r '.[0].title')
+    BEAD_DESC=$(echo "$ISSUES" | jq -r '.[0].description // "No description"')
 
     # Check bead labels for model override
-    LABEL_MODEL=$(extract_model_from_labels "$(echo "$READY_OUTPUT" | jq '.[0].labels // []')")
+    LABEL_MODEL=$(extract_model_from_labels "$(echo "$ISSUES" | jq '.[0].labels // []')")
     if [[ -n "$LABEL_MODEL" ]]; then
       CURRENT_MODEL="$LABEL_MODEL"
       echo "Model from bead label: $CURRENT_MODEL"
