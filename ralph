@@ -531,7 +531,7 @@ while true; do
   update_progress ".current_bead = \"$BEAD_ID\" | .current_model = \"$CURRENT_MODEL\" | .current_iteration = $ITERATION"
 
   # Double-check bead is still open
-  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+  BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r 'if .data then .data.status elif type == "array" then .[0].status else .status end' || echo "unknown")
   if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
     echo "⚠ Bead already closed, skipping to next..."
     SKIPPED=$((SKIPPED + 1))
@@ -611,7 +611,7 @@ EOF
     fi
 
     sleep 2
-    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r '.[0].status' || echo "unknown")
+    BEAD_STATUS=$(br show "$BEAD_ID" --json 2>/dev/null | jq -r 'if .data then .data.status elif type == "array" then .[0].status else .status end' || echo "unknown")
     echo "Bead status: $BEAD_STATUS"
 
     if [[ "$BEAD_STATUS" == "closed" || "$BEAD_STATUS" == "done" ]]; then
